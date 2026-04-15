@@ -10,11 +10,11 @@ description = "Open Language Model (OLMo)"
 authors = [
     { name = "Allen Institute for Artificial Intelligence", email = "olmo@allenai.org" }
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "numpy<2",
-    "torch>=2.1,<2.5",
+    "torch==2.11.0",
     "ai2-olmo-core==0.1.0",
     "omegaconf",
     "rich",
@@ -173,3 +173,8 @@ filterwarnings = [
     'ignore::DeprecationWarning:pkg_resources',
     'ignore::DeprecationWarning:google\.rpc',
 ]
+
+# torch is installed out-of-band from the appropriate wheel index for
+# the target platform (see README_ROCM.md / README for install steps).
+# We do NOT route torch through a pyproject source, so the same
+# pyproject.toml works on both CUDA and ROCm.
