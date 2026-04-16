@@ -738,6 +738,12 @@ class OLMoEBlock(OLMoBlock):
         if self.ffn.experts.bias is not None:
             torch.nn.init.zeros_(self.ffn.experts.bias)
         init_normal(self.ffn.router.layer, std=in_std, init_cutoff_factor=cutoff_factor)
+        if getattr(self.ffn, "shared_expert", None) is not None:
+            se = self.ffn.shared_expert
+            init_normal(se.up_proj, std=in_std, init_cutoff_factor=cutoff_factor)
+            init_normal(se.down_proj, std=ff_out_std, init_cutoff_factor=cutoff_factor)
+            if hasattr(se, "gate_proj"):
+                init_normal(se.gate_proj, std=in_std, init_cutoff_factor=cutoff_factor)
 
     def forward(
         self,
