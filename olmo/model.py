@@ -38,6 +38,7 @@ from .config import (
     ActivationCheckpointingStrategy,
     ActivationType,
     BlockType,
+    MoERoutingType,
     CheckpointType,
     FSDPWrapStrategy,
     InitFnType,
@@ -693,12 +694,14 @@ class OLMoEBlock(OLMoBlock):
         self.moe_args = config_to_moe_args(config)
         self.ffn = dMoE(self.moe_args) if self.config.moe_dropless else MoE(self.moe_args)
 
+        routing_type = config.effective_moe_routing_type
+        self._router_z_loss: Optional[torch.Tensor] = None
+        self._expert_assignments: Optional[torch.Tensor] = None
+
         # EMA state and hook for per-expert logit normalization (optional, see moe_router_ema_normalize).
-        if config.moe_router_ema_normalize:
+        if routing_type == MoERoutingType.ema:
             self._gate_ema_alpha = 0.99
             self._gate_ema_zloss_weight: float = config.moe_zloss_weight or 0.0
-            self._router_z_loss: Optional[torch.Tensor] = None
-            self._expert_assignments: Optional[torch.Tensor] = None
             # Plain fp32 attributes (not buffers) — lazily initialized on correct device in the hook.
             # Not registered as buffers because the olmo_core checkpointer doesn't save buffers anyway,
             # and keeping them as plain attributes avoids FSDP bf16 buffer_dtype casting issues.
@@ -706,6 +709,12 @@ class OLMoEBlock(OLMoBlock):
             self._ema_sq: Optional[torch.Tensor] = None    # E[X²]  (std = sqrt(E[X²] - E[X]²))
             self._ema_update_norm: float = 0.0
             self.ffn.router.register_forward_hook(self._router_ema_hook)
+        elif routing_type == MoERoutingType.deepseek:
+            self._deepseek_bias: Optional[torch.Tensor] = None  # fp32 [num_experts]
+            self._deepseek_u: float = config.moe_deepseek_bias_update_rate
+            self._deepseek_seq_aux_weight: float = config.moe_deepseek_seq_aux_loss_weight
+            self._router_seq_aux_loss: Optional[torch.Tensor] = None
+            self.ffn.router.register_forward_hook(self._router_deepseek_hook)
 
         self.attn_norm = LayerNorm.build(config)
         self.ff_norm = LayerNorm.build(config)
@@ -753,10 +762,13 @@ class OLMoEBlock(OLMoBlock):
         if self.ffn.experts.bias is not None:
             torch.nn.init.zeros_(self.ffn.experts.bias)
         init_normal(self.ffn.router.layer, std=in_std, init_cutoff_factor=cutoff_factor)
-        if self.config.moe_router_ema_normalize:
+        routing_type = self.config.effective_moe_routing_type
+        self._expert_assignments = None
+        if routing_type == MoERoutingType.ema:
             self._ema_mean = None
             self._ema_sq = None
-            self._expert_assignments = None
+        elif routing_type == MoERoutingType.deepseek:
+            self._deepseek_bias = None
 
     def _router_ema_hook(
         self,
@@ -777,6 +789,9 @@ class OLMoEBlock(OLMoBlock):
         raw_logits = logits.detach()  # [tokens, num_experts]
         num_experts = raw_logits.shape[1]
 
+        import os as _os
+        _DBG_EMA = _os.environ.get("DEBUG_EMA_HOOK", "0") == "1"
+
         # Lazy-init EMA on correct device (mean=0, E[X²]=1 → std=1 on first step).
         if self._ema_mean is None or self._ema_mean.device != raw_logits.device:
             self._ema_mean = torch.zeros(num_experts, dtype=torch.float32, device=raw_logits.device)
@@ -789,6 +804,18 @@ class OLMoEBlock(OLMoBlock):
         z = (logits - self._ema_mean) / ema_std
         norm_scores = z.softmax(dim=-1)
         norm_weights, norm_indices = module._top_k(norm_scores)
+
+        if _DBG_EMA:
+            _L = getattr(self, "layer_id", "?")
+            if not hasattr(self, "_dbg_call_ct"):
+                self._dbg_call_ct = 0
+            self._dbg_call_ct += 1
+            print(f"[ema L{_L} call#{self._dbg_call_ct}] id={id(self)} "
+                  f"logits NaN={torch.isnan(logits).sum().item()} "
+                  f"Inf={torch.isinf(logits).sum().item()} max_abs={logits.float().abs().max().item():.3e} | "
+                  f"BEFORE_UPDATE ema_mean={[f'{v:.3f}' for v in self._ema_mean.tolist()]} "
+                  f"ema_sq={[f'{v:.3f}' for v in self._ema_sq.tolist()]} | "
+                  f"norm_weights max={norm_weights.float().max().item():.3e}", flush=True)
 
         if module.args.moe_normalize_expert_weights:
             norm_weights = norm_weights / torch.norm(
@@ -817,6 +844,88 @@ class OLMoEBlock(OLMoBlock):
 
         # Cast back to original dtype so megablocks sparse kernels see the expected precision.
         return norm_scores.to(orig_dtype), logits, norm_weights.to(orig_dtype), norm_indices
+
+    def _router_deepseek_hook(
+        self,
+        module: torch.nn.Module,
+        input: Any,
+        output: Any,
+    ) -> Any:
+        """DeepSeek v3 auxiliary-loss-free routing. Paper: arXiv:2412.19437 §2.1.2.
+
+        Differences from megablocks' default routing:
+          - Per-expert scores use **sigmoid** (independent per expert), not softmax.
+            Megablocks' upstream `scores` (softmax) is ignored — we recompute from `logits`.
+          - Per-expert bias `b_i` shifts top-k selection but does not affect gate weights.
+          - Gate weights are the unbiased sigmoid scores gathered at selected indices,
+            then L1-renormalized (matches HF DeepseekV3TopkRouter and Megatron-Core).
+          - Bias update: `b_i += u * sign(expected - actual)` (paper γ = 0.001).
+          - Optional complementary per-sequence aux loss with weight α (paper α = 1e-4).
+            See DEEPSEEK_ROUTING_NOTES.md for the microbatch-vs-sequence approximation.
+        """
+        self._router_seq_aux_loss = None
+        _, logits, _, _ = output
+        orig_dtype = logits.dtype
+        num_experts = logits.shape[1]
+
+        # Paper §2.1.2: sigmoid over router logits gives independent per-expert scores.
+        # Gradient path: sig_scores → logits (→ router params) is preserved for both
+        # the gate_weights forward path and the seq aux loss.
+        sig_scores = logits.float().sigmoid()
+
+        # Lazy-init bias on correct device.
+        if self._deepseek_bias is None or self._deepseek_bias.device != sig_scores.device:
+            self._deepseek_bias = torch.zeros(num_experts, dtype=torch.float32, device=sig_scores.device)
+
+        # Selection uses bias-shifted scores (no grad through bias — it's updated by rule).
+        biased_scores = sig_scores + self._deepseek_bias
+        _, new_indices = module._top_k(biased_scores)
+
+        # Gate weights: gather UNBIASED sigmoid scores, then L1 re-normalize to sum to 1.
+        gate_weights = sig_scores.gather(1, new_indices)
+        gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        if module.args.moe_normalize_expert_weights:
+            gate_weights = gate_weights / torch.norm(
+                gate_weights, p=module.args.moe_normalize_expert_weights, dim=-1, keepdim=True
+            )
+
+        # Complementary sequence-wise aux loss (paper: α · Σ_i f_i · P_i · N_r).
+        # Approximation: whole microbatch treated as one "sequence" (see notes file).
+        if self.training and self._deepseek_seq_aux_weight > 0:
+            n_tokens = new_indices.shape[0]
+            top_k = new_indices.shape[1]
+            # f_i = fraction of tokens routed to expert i (no grad — indices only).
+            counts = torch.bincount(new_indices.reshape(-1), minlength=num_experts).float()
+            f_i = counts / float(n_tokens * top_k)
+            # P_i = mean sigmoid score for expert i (grad flows via sig_scores → logits).
+            p_i = sig_scores.mean(dim=0)
+            self._router_seq_aux_loss = (
+                self._deepseek_seq_aux_weight * float(num_experts) * (f_i * p_i).sum()
+            )
+
+        # Update bias to balance load (training only, no gradients).
+        # TODO(gap-1): move to once-per-step when using grad accumulation.
+        # TODO(gap-2): all_reduce(actual_load, group=dp) before sign() when scaling to >1 GPU.
+        if self.training:
+            with torch.no_grad():
+                n_tokens = new_indices.shape[0]
+                top_k = new_indices.shape[1]
+                actual_load = torch.bincount(new_indices.reshape(-1), minlength=num_experts).float()
+                expected_load = float(n_tokens * top_k) / num_experts
+                self._deepseek_bias += self._deepseek_u * torch.sign(expected_load - actual_load)
+
+                # Track expert assignments for logging.
+                if self._expert_assignments is None:
+                    self._expert_assignments = actual_load
+                else:
+                    self._expert_assignments += actual_load
+
+        # Return tuple shape expected by megablocks: (scores, logits, expert_weights, expert_indices).
+        # `sig_scores` replaces megablocks' softmax scores in slot 0; it isn't consumed further
+        # by megablocks since moe_loss_weight is 0 for deepseek runs, but we return it for shape
+        # consistency.
+        return sig_scores.to(orig_dtype), logits, gate_weights.to(orig_dtype), new_indices
 
     def forward(
         self,
@@ -886,20 +995,39 @@ class OLMoEBlock(OLMoBlock):
         # shape: (batch_size, seq_len, d_model)
         og_x = x
 
+        import os as _os
+        _DBG_FINITE = _os.environ.get("DEBUG_FINITE", "0") == "1"
         if self.config.norm_after:
             x = self.ffn(x)
             if self._activation_checkpoint_fn is not None:
                 x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
             else:
                 x = self.ff_norm(x)
-            return og_x + self.dropout(x), cache
+            out = og_x + self.dropout(x)
         else:
             if self._activation_checkpoint_fn is not None:
-                x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
+                x_normed = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
             else:
-                x = self.ff_norm(x)
+                x_normed = self.ff_norm(x)
+            if _DBG_FINITE:
+                _nn_x_normed = torch.isnan(x_normed).sum().item()
+                _ii_x_normed = torch.isinf(x_normed).sum().item()
+                print(f"[blk{getattr(self,'layer_id','?')}] x_normed NaN={_nn_x_normed} Inf={_ii_x_normed} "
+                      f"max_abs={x_normed.abs().max().item():.3e}", flush=True)
+            ffn_out = self.ffn(x_normed)
+            if _DBG_FINITE:
+                _nn_f = torch.isnan(ffn_out).sum().item()
+                _ii_f = torch.isinf(ffn_out).sum().item()
+                print(f"[blk{getattr(self,'layer_id','?')}] ffn_out NaN={_nn_f} Inf={_ii_f} "
+                      f"max_abs={ffn_out.abs().max().item():.3e}", flush=True)
             # Activation checkpointing for the MoE FFN is not supported
-            return og_x + self.dropout(self.ffn(x)), cache
+            out = og_x + self.dropout(ffn_out)
+        if _DBG_FINITE:
+            _nn = torch.isnan(out).sum().item()
+            _ii = torch.isinf(out).sum().item()
+            print(f"[blk{getattr(self,'layer_id','?')}] output NaN={_nn} Inf={_ii} "
+                  f"max_abs={out.abs().max().item():.3e}", flush=True)
+        return out, cache
 
 
 class OLMoSequentialBlock(OLMoBlock):

@@ -33,6 +33,7 @@ __all__ = [
     "ActivationType",
     "ActivationCheckpointingStrategy",
     "BlockType",
+    "MoERoutingType",
     "LayerNormType",
     "InitFnType",
     "ModelConfig",
@@ -203,6 +204,17 @@ class BlockType(StrEnum):
     """
     A block for OLMoE-style Mixture-of-Experts models.
     """
+
+
+class MoERoutingType(StrEnum):
+    olmoe = "olmoe"
+    """Standard top-k with megablocks aux load-balancing loss + z-loss."""
+
+    ema = "ema"
+    """EMA z-score normalization of router logits, no auxiliary losses."""
+
+    deepseek = "deepseek"
+    """DeepSeek v3 auxiliary-loss-free routing with per-expert bias adjustment."""
 
 
 class InitFnType(StrEnum):
@@ -509,6 +521,23 @@ class ModelConfig(BaseConfig):
     replacing the need for a load-balancing auxiliary loss (set moe_loss_weight=0 when enabled).
     """
 
+    moe_routing_type: MoERoutingType = MoERoutingType.olmoe
+    """
+    Selects the MoE routing strategy. Overrides moe_router_ema_normalize when set explicitly.
+    """
+
+    moe_deepseek_bias_update_rate: float = 0.001
+    """
+    Step size for DeepSeek v3 per-expert bias updates. Only used when moe_routing_type is 'deepseek'.
+    """
+
+    moe_deepseek_seq_aux_loss_weight: float = 1e-4
+    """
+    Weight (alpha) for the DeepSeek v3 complementary sequence-wise auxiliary loss.
+    Set to 0.0 to disable. Paper default: 1e-4. Only used when moe_routing_type is 'deepseek'.
+    See DEEPSEEK_ROUTING_NOTES.md for the approximation details.
+    """
+
     moe_dropless: Optional[bool] = True
     """
     Whether to use [dMoE](https://arxiv.org/abs/2211.15841).
@@ -534,6 +563,15 @@ class ModelConfig(BaseConfig):
     """
     Apply norm after the attention/feedforward layers rather than before, as introduced in the Swin transformer paper (Liu et al).
     """
+
+    @property
+    def effective_moe_routing_type(self) -> MoERoutingType:
+        """Resolve routing type, with backward compat for moe_router_ema_normalize."""
+        if self.moe_routing_type != MoERoutingType.olmoe:
+            return self.moe_routing_type
+        if self.moe_router_ema_normalize:
+            return MoERoutingType.ema
+        return MoERoutingType.olmoe
 
     @property
     def effective_n_kv_heads(self) -> int:
