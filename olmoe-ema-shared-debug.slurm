@@ -25,4 +25,5 @@ torchrun \
     --nproc_per_node=1 \
     --master_port=29530 \
     scripts/train.py \
-    configs/olmoe/ablations/olmoe-1.2b-ema-shared-repro-smoketest.yaml
+    configs/olmoe/ablations/olmoe-1.2b-ema-shared-repro-smoketest.yaml \
+    --wandb.name=olmoe-1.2b-ema-shared-repro-smoketest-${SLURM_JOB_ID}

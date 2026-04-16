@@ -22,4 +22,5 @@ torchrun \
     --nproc_per_node=1 \
     --master_port=29503 \
     scripts/train.py \
-    configs/olmoe/ablations/olmoe-1.2b-deepseek-shared-2gpu.yaml
+    configs/olmoe/ablations/olmoe-1.2b-deepseek-shared-2gpu.yaml \
+    --wandb.name=olmoe-1.2b-a0.5b-deepseek-shared-${SLURM_JOB_ID}

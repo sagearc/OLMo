@@ -12,6 +12,8 @@
 
 export ROCM_HOME=/opt/rocm-6.4.3
 export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+export DEBUG_FINITE=1
+export DEBUG_EMA_HOOK=1
 
 cd /home/morg/students/sagiahrac/repos/olmo-rocm
 
@@ -22,4 +24,5 @@ torchrun \
     --nproc_per_node=1 \
     --master_port=29501 \
     scripts/train.py \
-    configs/olmoe/ablations/olmoe-1.2b-ema-no-losses-shared-2gpu.yaml
+    configs/olmoe/ablations/olmoe-1.2b-ema-no-losses-shared-2gpu.yaml \
+    --wandb.name=olmoe-1.2b-a0.5b-ema-no-losses-shared-${SLURM_JOB_ID}

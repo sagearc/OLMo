@@ -28,4 +28,5 @@ torchrun \
     --max_duration=30ba \
     --save_interval=10000 \
     --eval_interval=10000 \
-    --wandb.project=MoE-smoketest
+    --wandb.project=MoE-smoketest \
+    --wandb.name=olmoe-1.2b-deepseek-shared-smoketest-${SLURM_JOB_ID}

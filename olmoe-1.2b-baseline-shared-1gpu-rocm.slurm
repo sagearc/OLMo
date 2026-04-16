@@ -21,4 +21,5 @@ torchrun \
     --standalone \
     --nproc_per_node=1 \
     scripts/train.py \
-    configs/olmoe/ablations/olmoe-1.2b-baseline-shared-2gpu.yaml
+    configs/olmoe/ablations/olmoe-1.2b-baseline-shared-2gpu.yaml \
+    --wandb.name=olmoe-1.2b-a0.5b-baseline-shared-${SLURM_JOB_ID}

@@ -22,4 +22,5 @@ torchrun \
     --nproc_per_node=1 \
     --master_port=29505 \
     scripts/train.py \
-    configs/olmoe/ablations/olmoe-tiny-deepseek-smoketest.yaml
+    configs/olmoe/ablations/olmoe-tiny-deepseek-smoketest.yaml \
+    --wandb.name=olmoe-tiny-deepseek-smoketest-${SLURM_JOB_ID}
