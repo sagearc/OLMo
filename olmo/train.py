@@ -44,6 +44,7 @@ from .aliases import PathOrStr
 from .checkpoint import Checkpointer, FullCheckpointer, build_sharded_checkpointer
 from .config import (
     BlockType,
+    MoERoutingType,
     CheckpointType,
     DDPGradSyncMode,
     DistributedStrategy,
@@ -76,6 +77,7 @@ try:
         clear_load_balancing_loss,
         get_load_balancing_loss,
     )
+    from megablocks.layers.router import clear_router_zloss
 except ImportError:
     pass
 
@@ -811,11 +813,18 @@ class Trainer:
 
         ce_batch_loss = torch.tensor(0.0, device=self.device)
         z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
+        # Active when either the standard megablocks aux loss is enabled, or the DeepSeek
+        # complementary per-sequence aux loss is enabled.
+        _deepseek_seq_aux_active = (
+            self.model.config.block_type == BlockType.moe
+            and self.model.config.effective_moe_routing_type == MoERoutingType.deepseek
+            and self.model.config.moe_deepseek_seq_aux_loss_weight > 0
+        )
         lb_batch_loss = (
             None
             if (
                 self.model.config.block_type != BlockType.moe
-                or not self.model.config.moe_loss_weight
+                or (not self.model.config.moe_loss_weight and not _deepseek_seq_aux_active)
             )
             else torch.tensor(0.0, device=self.device)
         )
@@ -870,14 +879,21 @@ class Trainer:
                         moe_z_loss = moe_z_loss / len(micro_batches)
                     elif self.model.config.moe_loss_weight:
                         lb_loss = batched_load_balancing_loss(self.moe_args) / len(micro_batches)
-                    if self.model.config.moe_log_expert_assignment and not self.model.config.moe_router_ema_normalize:
+                    # Megablocks only saves load balancing data when moe_loss_weight > 0.
+                    # The hook-based routing paths (ema, deepseek) set moe_loss_weight=0 and
+                    # collect expert assignments directly from block._expert_assignments below.
+                    if (
+                        self.model.config.moe_log_expert_assignment
+                        and self.model.config.effective_moe_routing_type == MoERoutingType.olmoe
+                    ):
                         if self.model.config.moe_zloss_weight:
                             tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
                         else:
                             tokens_per_expert, _ = zip(*get_load_balancing_loss())
                         expert_assignments += torch.stack(tokens_per_expert, dim=0)
                     clear_load_balancing_loss()
-                    if self.model.config.moe_log_expert_assignment and self.model.config.moe_router_ema_normalize:
+                    clear_router_zloss()  # prevent _ROUTER_LOGITS from accumulating (memory leak)
+                    if self.model.config.moe_log_expert_assignment and self.model.config.effective_moe_routing_type != MoERoutingType.olmoe:
                         for layer_idx, block in enumerate(self.model.transformer.blocks):
                             # Unwrap FSDP: writing block.attr = None would shadow the original
                             # OLMoEBlock's attribute on the FSDP wrapper's __dict__, causing all
@@ -910,6 +926,23 @@ class Trainer:
                             loss += ema_z_loss
                             assert moe_z_batch_loss is not None
                             moe_z_batch_loss += ema_z_loss.detach()
+
+                    # DeepSeek path: complementary per-sequence aux loss from the router hook.
+                    # Paper α = 1e-4. See DEEPSEEK_ROUTING_NOTES.md.
+                    if (
+                        self.model.config.effective_moe_routing_type == MoERoutingType.deepseek
+                        and self.model.config.moe_deepseek_seq_aux_loss_weight > 0
+                    ):
+                        ds_seq_losses = []
+                        for block in self.model.transformer.blocks:
+                            inner_block = block.module if isinstance(block, FSDP) else block
+                            if inner_block._router_seq_aux_loss is not None:
+                                ds_seq_losses.append(inner_block._router_seq_aux_loss)
+                            inner_block._router_seq_aux_loss = None  # reset for next micro-batch
+                        if ds_seq_losses:
+                            ds_seq_loss = torch.stack(ds_seq_losses).mean() / len(micro_batches)
+                            loss += ds_seq_loss
+                            lb_batch_loss += ds_seq_loss.detach()
 
                 # Run backward pass.
                 loss.backward()
