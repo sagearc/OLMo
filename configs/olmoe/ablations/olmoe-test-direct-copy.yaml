@@ -1,4 +1,4 @@
-run_name: olmoe-1.2b-a0.5b-baseline
+run_name: olmoe17-8x1b-local-ema-small-shared-2gpu
 seed: 6198
 dry_run: false
 no_pre_train_checkpoint: true
@@ -41,9 +41,10 @@ model:
   moe_num_experts: 8
   moe_dropless: true
   moe_mlp_impl: sparse
-  moe_zloss_weight: 0.001
-  moe_loss_weight: 0.01
-  moe_router_ema_normalize: false
+  moe_zloss_weight: 0.0
+  moe_loss_weight: 0.0
+  moe_router_ema_normalize: true
+  moe_shared_expert: true
 
 compile: null
 
@@ -79,9 +80,9 @@ sharded_checkpointer: olmo_core
 
 load_path: null
 
-max_duration: 2ep
+max_duration: 3
 global_train_batch_size: 32
-device_train_microbatch_size: 32
+device_train_microbatch_size: 8
 
 precision: amp_bf16
 activation_checkpointing: fine_grained

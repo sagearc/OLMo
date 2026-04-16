@@ -1,0 +1,113 @@
+run_name: olmoe-1.2b-ema-shared-repro-smoketest
+seed: 6198
+dry_run: false
+no_pre_train_checkpoint: true
+
+wandb:
+  name: ${run_name}
+  project: MoE-smoketest
+  entity: sagiah
+  group: null
+
+model:
+  d_model: 2048
+  n_heads: 16
+  n_layers: 8
+  mlp_ratio: 2
+  weight_tying: false
+  alibi: false
+  rope: true
+  flash_attention: true
+  attention_dropout: 0.0
+  attention_layer_norm: true
+  include_bias: false
+  block_type: moe
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  bias_for_layer_norm: false
+  attention_layer_norm_with_affine: false
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 4096
+  vocab_size: 50280
+  embedding_size: 50304
+  eos_token_id: 0
+  pad_token_id: 1
+  init_device: meta
+  init_fn: normal
+  init_cutoff_factor: 3
+  moe_top_k: 2
+  moe_num_experts: 8
+  moe_dropless: true
+  moe_mlp_impl: sparse
+  moe_zloss_weight: 0.0
+  moe_loss_weight: 0.0
+  moe_router_ema_normalize: true
+  moe_shared_expert: true
+
+compile: null
+
+optimizer:
+  name: adamw
+  learning_rate: 4.0e-4
+  weight_decay: 0.1
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  betas:
+  - 0.9
+  - 0.95
+  metrics_log_interval: 1
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  t_warmup: 1000000000
+  t_max: 3e12
+  alpha_f: 0.1
+
+tokenizer:
+  identifier: tokenizers/allenai_gpt-neox-olmo-dolma-v1_5.json
+  truncate_direction: right
+
+save_folder: /home/morg/students/sagiahrac/repos/olmo-rocm/runs/${run_name}
+save_overwrite: true
+save_interval: 100000
+save_interval_ephemeral: null
+save_num_checkpoints_to_keep: 1
+sharded_checkpointer: olmo_core
+
+load_path: null
+
+max_duration: 3
+global_train_batch_size: 2
+device_train_microbatch_size: 2
+
+precision: amp_bf16
+activation_checkpointing: fine_grained
+distributed_strategy: fsdp
+
+fsdp:
+  wrapping_strategy: by_block
+  precision: mixed
+  sharding_strategy: FULL_SHARD
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+speed_monitor:
+  window_size: 1
+
+eval_interval: 100000
+eval_subset_num_batches: 1
+device_eval_batch_size: 2
+
+data:
+  num_workers: 0
+  drop_last: true
+  pin_memory: false
+  prefetch_factor: 2
+  persistent_workers: false
+  timeout: 0
+  paths:
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/wiki/part-0-00000.npy
