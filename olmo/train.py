@@ -947,9 +947,15 @@ class Trainer:
                 # Run backward pass.
                 loss.backward()
 
-            # Remove output hooks
-            for hook in output_hooks:
-                hook.remove()
+        # Apply DeepSeek bias update once per step using full-step accumulated load.
+        if self.model.config.effective_moe_routing_type == MoERoutingType.deepseek:
+            for block in self.model.transformer.blocks:
+                inner_block = block.module if isinstance(block, FSDP) else block
+                inner_block.apply_deepseek_bias_update()
+
+        # Remove output hooks
+        for hook in output_hooks:
+            hook.remove()
 
         return ce_batch_loss, z_batch_loss, lb_batch_loss, moe_z_batch_loss, expert_assignments
 
@@ -1016,12 +1022,12 @@ class Trainer:
         # Optimizer step.
         self.optim.step()
 
-        # Collect metrics and check for NaN loss.
+        # Collect metrics and check for NaN/Inf loss.
         # NOTE: this involves a bunch of host-device syncs so we wait until the last moment to do this.
-        if torch.isnan(ce_batch_loss):
-            raise ValueError("nan loss encountered")
-        if z_batch_loss is not None and torch.isnan(z_batch_loss):
-            raise ValueError("nan loss encountered")
+        if not torch.isfinite(ce_batch_loss):
+            raise ValueError("nan/inf loss encountered")
+        if z_batch_loss is not None and not torch.isfinite(z_batch_loss):
+            raise ValueError("nan/inf loss encountered")
         for key, value in optim_metrics.items():
             metrics[f"optim/{key}"] = value.item()
         self.cur_train_loss = ce_batch_loss.item()

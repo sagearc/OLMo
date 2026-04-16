@@ -23,14 +23,15 @@ to support `moe_routing_type: deepseek` ablations.
 | Bias update `b += γ · sign(expected − actual)` | ✅ | γ = `moe_deepseek_bias_update_rate` (default 0.001, matches paper) |
 | Sequence-wise complementary aux loss, α = 1e-4 | ⚠️ approximated | Computed over the whole microbatch as one "sequence" because megablocks flattens (batch, seq) before the router, losing sequence boundaries. In practice this slightly *under-counts* per-sequence imbalance vs. the paper's formulation. |
 
+## Batch size rationale
+
+Ablation configs use `global_train_batch_size=1024`, `device_train_microbatch_size=64` (16 accumulation steps, ~4M tokens/step). This matches the DeepSeek auxiliary-loss-free paper's 1B ablation scale (1152 sequences × 4096 tokens ≈ 4.7M tokens/step) and is required for the bias update to operate on a clean full-step signal rather than noisy microbatch fragments.
+
 ## Known gaps vs. paper / Megatron-Core
 
-### 1. Update cadence: per-microbatch, not per-step
+### 1. ~~Update cadence: per-microbatch, not per-step~~ — FIXED
 - **Paper / Megatron**: bias update runs **once per optimizer step**, using the full-batch load.
-- **Here**: bias update runs inside the forward hook, i.e. **once per microbatch**.
-- **Effect on current 1-GPU config** (`global_train_batch_size=32`, `device_train_microbatch_size=32`, 1 GPU → 1 microbatch per step): **no difference**.
-- **Breaks when**: grad accumulation > 1. Each microbatch would apply `sign()` on its local fragment, effectively multiplying the update rate by `num_microbatches` and operating on a noisier signal.
-- **Fix when scaling up**: accumulate `actual_load` in a layer-level buffer across microbatches; apply bias update in `train.py` between `optimizer.step()` and the next forward.
+- **Fix**: `actual_load` is now accumulated into `_deepseek_load_accum` across microbatches in the forward hook; `apply_deepseek_bias_update()` is called once per step from `train.py` after the microbatch loop, applies `sign(expected − accumulated)`, then resets the accumulator.
 
 ### 2. No cross-rank all-reduce of `actual_load`
 - **Paper / Megatron**: sum `tokens_per_expert` across the global batch group (DP × TP × CP) before computing `sign(offset)`.
@@ -66,7 +67,7 @@ to support `moe_routing_type: deepseek` ablations.
 | Gate weights = unbiased + renorm | ✅ | ✅ | ✅ |
 | Bias update rule | `sign(expected−actual) · γ` | ✅ | ✅ |
 | γ default | 0.001 | 0.001 | 0.001 ✅ |
-| Update cadence | per step | per step | per microbatch (≡ per step on current config) |
+| Update cadence | per step | per step | per step ✅ |
 | Cross-rank all-reduce | global batch | TP×DP×CP group | not done (N/A on 1 GPU) |
 | Seq aux loss α | 1e-4 | optional (same α) | 1e-4, microbatch-wise approximation |
 | Bias checkpointing | N/A (no resume) | saved in training state | not saved |
@@ -75,6 +76,5 @@ to support `moe_routing_type: deepseek` ablations.
 ## When to revisit
 Before any of the following, re-read this file and fix the corresponding gap:
 - Running on > 1 GPU → fix gap 2 (all-reduce)
-- Using grad accumulation → fix gap 1 (cadence)
 - Resuming from checkpoint → fix gap 3 (checkpoint bias)
-- Claiming strict paper parity in a write-up → fix gaps 1, 2, 3, 4
+- Claiming strict paper parity in a write-up → fix gaps 2, 3, 4

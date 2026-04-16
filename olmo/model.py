@@ -714,6 +714,7 @@ class OLMoEBlock(OLMoBlock):
             self._deepseek_u: float = config.moe_deepseek_bias_update_rate
             self._deepseek_seq_aux_weight: float = config.moe_deepseek_seq_aux_loss_weight
             self._router_seq_aux_loss: Optional[torch.Tensor] = None
+            self._deepseek_load_accum: Optional[torch.Tensor] = None  # accumulated across microbatches
             self.ffn.router.register_forward_hook(self._router_deepseek_hook)
 
         self.attn_norm = LayerNorm.build(config)
@@ -769,6 +770,7 @@ class OLMoEBlock(OLMoBlock):
             self._ema_sq = None
         elif routing_type == MoERoutingType.deepseek:
             self._deepseek_bias = None
+            self._deepseek_load_accum = None
 
     def _router_ema_hook(
         self,
@@ -904,16 +906,18 @@ class OLMoEBlock(OLMoBlock):
                 self._deepseek_seq_aux_weight * float(num_experts) * (f_i * p_i).sum()
             )
 
-        # Update bias to balance load (training only, no gradients).
-        # TODO(gap-1): move to once-per-step when using grad accumulation.
+        # Accumulate load across microbatches; bias applied once per step via apply_deepseek_bias_update().
         # TODO(gap-2): all_reduce(actual_load, group=dp) before sign() when scaling to >1 GPU.
         if self.training:
             with torch.no_grad():
                 n_tokens = new_indices.shape[0]
                 top_k = new_indices.shape[1]
                 actual_load = torch.bincount(new_indices.reshape(-1), minlength=num_experts).float()
-                expected_load = float(n_tokens * top_k) / num_experts
-                self._deepseek_bias += self._deepseek_u * torch.sign(expected_load - actual_load)
+
+                if self._deepseek_load_accum is None:
+                    self._deepseek_load_accum = actual_load.clone()
+                else:
+                    self._deepseek_load_accum += actual_load
 
                 # Track expert assignments for logging.
                 if self._expert_assignments is None:
@@ -926,6 +930,21 @@ class OLMoEBlock(OLMoBlock):
         # by megablocks since moe_loss_weight is 0 for deepseek runs, but we return it for shape
         # consistency.
         return sig_scores.to(orig_dtype), logits, gate_weights.to(orig_dtype), new_indices
+
+    def apply_deepseek_bias_update(self) -> None:
+        """Apply one bias update using loads accumulated across all microbatches this step.
+
+        Called once per optimizer step from train.py, after the microbatch loop.
+        Paper (2408.15664): bias updated once per batch using full-batch load statistics.
+        """
+        if self._deepseek_load_accum is None:
+            return
+        with torch.no_grad():
+            # sum() == total token-expert assignments this step (n_tokens * top_k, accumulated)
+            expected_load = self._deepseek_load_accum.sum() / len(self._deepseek_load_accum)
+            # TODO(gap-2): dist.all_reduce(_deepseek_load_accum, group=dp_group) when DP > 1
+            self._deepseek_bias += self._deepseek_u * torch.sign(expected_load - self._deepseek_load_accum)
+            self._deepseek_load_accum = None
 
     def forward(
         self,
@@ -1014,12 +1033,30 @@ class OLMoEBlock(OLMoBlock):
                 _ii_x_normed = torch.isinf(x_normed).sum().item()
                 print(f"[blk{getattr(self,'layer_id','?')}] x_normed NaN={_nn_x_normed} Inf={_ii_x_normed} "
                       f"max_abs={x_normed.abs().max().item():.3e}", flush=True)
-            ffn_out = self.ffn(x_normed)
             if _DBG_FINITE:
+                _lid = getattr(self, 'layer_id', '?')
+                _dbg_hooks = []
+                def _make_sub_probe(tag):
+                    def _probe(m, inp, out):
+                        t = out[0] if isinstance(out, tuple) else out
+                        nn_ = torch.isnan(t).sum().item()
+                        ii_ = torch.isinf(t).sum().item()
+                        print(f"[blk{_lid}] {tag} NaN={nn_} Inf={ii_} "
+                              f"max_abs={t.abs().max().item():.3e}", flush=True)
+                    return _probe
+                if hasattr(self.ffn, 'experts'):
+                    _dbg_hooks.append(self.ffn.experts.register_forward_hook(_make_sub_probe("ffn.experts")))
+                if getattr(self.ffn, 'shared_expert', None) is not None:
+                    _dbg_hooks.append(self.ffn.shared_expert.register_forward_hook(_make_sub_probe("ffn.shared_expert")))
+                ffn_out = self.ffn(x_normed)
+                for _h in _dbg_hooks:
+                    _h.remove()
                 _nn_f = torch.isnan(ffn_out).sum().item()
                 _ii_f = torch.isinf(ffn_out).sum().item()
-                print(f"[blk{getattr(self,'layer_id','?')}] ffn_out NaN={_nn_f} Inf={_ii_f} "
+                print(f"[blk{_lid}] ffn_out NaN={_nn_f} Inf={_ii_f} "
                       f"max_abs={ffn_out.abs().max().item():.3e}", flush=True)
+            else:
+                ffn_out = self.ffn(x_normed)
             # Activation checkpointing for the MoE FFN is not supported
             out = og_x + self.dropout(ffn_out)
         if _DBG_FINITE:
